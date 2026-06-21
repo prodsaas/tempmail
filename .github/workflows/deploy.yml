@@ -1,0 +1,86 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Detect changed paths
+        id: changes
+        uses: dorny/paths-filter@v4
+        with:
+          filters: |
+            api:
+              - 'api/**'
+            client:
+              - 'client/**'
+
+      - name: Setup SSH
+        if: |
+          steps.changes.outputs.api == 'true'
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Deploy api
+        if: steps.changes.outputs.api == 'true'
+        run: |
+          rsync -rvz --delete \
+            --exclude=".env" \
+            --exclude="node_modules" \
+            api/ \
+            ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:~/tempmail/api/
+
+      - name: Install api dependencies & restart PM2
+        if: steps.changes.outputs.api == 'true'
+        run: |
+          ssh ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} << 'EOF'
+            export NVM_DIR="$HOME/.nvm"
+            [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+
+            cd ~/tempmail/api
+            npm install --omit=dev
+
+            if pm2 describe tempmail > /dev/null 2>&1; then
+              pm2 restart tempmail
+            else
+              pm2 start npm --name "tempmail" -- start
+            fi
+
+            pm2 save
+          EOF
+
+      - name: Setup Node.js (client)
+        if: steps.changes.outputs.client == 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Install client dependencies
+        if: steps.changes.outputs.client == 'true'
+        working-directory: client
+        run: npm ci
+
+      - name: Build client
+        if: steps.changes.outputs.client == 'true'
+        working-directory: client
+        env:
+          VITE_API_URL: ${{ secrets.VITE_API_URL }}
+        run: npm run build
+
+      - name: Deploy client
+        if: steps.changes.outputs.client == 'true'
+        run: |
+          rsync -rvz --delete \
+            client/dist/ \
+            ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:~/tempmail/client/
